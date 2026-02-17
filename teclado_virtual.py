@@ -263,8 +263,14 @@ def calibrar(root, estado_callback=None):
             resultado_map[char] = 'vkscan'
             continue
 
+        # --- Probar Método 3: Clipboard ---
+        ok3, got3 = _test_char_metodo(root, test_entry, char, _enviar_clipboard)
+        if ok3:
+            resultado_map[char] = 'clipboard'
+            continue
+
         # Ninguno funcionó
-        resultado_map[char] = 'unicode'  # fallback
+        resultado_map[char] = 'clipboard'  # fallback más seguro
         errores.append((char, got1, got2))
 
     test_win.destroy()
@@ -333,11 +339,40 @@ def _listar_perfiles():
 
 
 # ═════════════════════════════════════════════════════════════
+# Método 3: Clipboard — pegar vía portapapeles (funciona SIEMPRE)
+# ═════════════════════════════════════════════════════════════
+
+def _enviar_clipboard(char):
+    """Envía un carácter copiándolo al portapapeles y pegándolo con Ctrl+V."""
+    try:
+        ctypes.windll.user32.OpenClipboard(0)
+        ctypes.windll.user32.EmptyClipboard()
+        # CF_UNICODETEXT = 13
+        text_bytes = char.encode('utf-16-le') + b'\x00\x00'
+        h_mem = ctypes.windll.kernel32.GlobalAlloc(0x0042, len(text_bytes))
+        p_mem = ctypes.windll.kernel32.GlobalLock(h_mem)
+        ctypes.memmove(p_mem, text_bytes, len(text_bytes))
+        ctypes.windll.kernel32.GlobalUnlock(h_mem)
+        ctypes.windll.user32.SetClipboardData(13, h_mem)
+        ctypes.windll.user32.CloseClipboard()
+
+        # Simular Ctrl+V
+        _key_event(VK_CONTROL, up=False)
+        _key_event(0x56, up=False)   # V
+        _key_event(0x56, up=True)
+        _key_event(VK_CONTROL, up=True)
+        time.sleep(0.02)
+        return True
+    except Exception:
+        return False
+
+
+# ═════════════════════════════════════════════════════════════
 # Envío inteligente (usa calibración si existe)
 # ═════════════════════════════════════════════════════════════
 
 _metodo_por_char = {}
-_metodo_forzado = None  # None = auto (calibración), 'unicode', 'vkscan'
+_metodo_forzado = None  # None = auto, 'unicode', 'vkscan', 'clipboard'
 
 
 def enviar_char(char):
@@ -349,7 +384,10 @@ def enviar_char(char):
         return
     elif _metodo_forzado == 'vkscan':
         if not _enviar_vkscan(char):
-            _enviar_unicode(char)  # fallback si VkScan no soporta el char
+            _enviar_unicode(char)
+        return
+    elif _metodo_forzado == 'clipboard':
+        _enviar_clipboard(char)
         return
 
     # Modo auto: usar calibración
@@ -357,6 +395,8 @@ def enviar_char(char):
     if metodo == 'vkscan':
         if not _enviar_vkscan(char):
             _enviar_unicode(char)
+    elif metodo == 'clipboard':
+        _enviar_clipboard(char)
     else:
         _enviar_unicode(char)
 
@@ -432,13 +472,17 @@ class TecladoSimulador:
 
         # ── Selector de método ──
         ttk.Label(frame_config, text="Método de escritura:").grid(row=2, column=0, sticky="w", pady=2)
-        self.metodo_var = tk.StringVar(value="auto")
+        default_metodo = "auto" if not self.es_remoto else "vkscan"
+        self.metodo_var = tk.StringVar(value=default_metodo)
         metodo_combo = ttk.Combobox(frame_config, textvariable=self.metodo_var,
-                                     values=["auto", "unicode", "vkscan"],
-                                     state="readonly", width=10,
+                                     values=["auto", "unicode", "vkscan", "clipboard"],
+                                     state="readonly", width=12,
                                      font=("Segoe UI", 10))
         metodo_combo.grid(row=2, column=1, padx=(8, 0), pady=2)
         metodo_combo.bind("<<ComboboxSelected>>", self._cambiar_metodo)
+        # Aplicar el método forzado por defecto (sin tocar estado_var aún)
+        global _metodo_forzado
+        _metodo_forzado = None if default_metodo == 'auto' else default_metodo
 
         # ── Info del entorno ──
         entorno_txt = f"{'🖥 REMOTO (RDP)' if self.es_remoto else '💻 Local'} — {self.entorno_id}"
@@ -497,15 +541,14 @@ class TecladoSimulador:
     def _cambiar_metodo(self, event=None):
         global _metodo_forzado
         sel = self.metodo_var.get()
-        if sel == 'auto':
-            _metodo_forzado = None
-            self.estado_var.set("Método: Auto (usa calibración por carácter)")
-        elif sel == 'unicode':
-            _metodo_forzado = 'unicode'
-            self.estado_var.set("Método: Unicode forzado (funciona local, falla en RDP)")
-        elif sel == 'vkscan':
-            _metodo_forzado = 'vkscan'
-            self.estado_var.set("Método: VkScan forzado (mejor para sesiones remotas)")
+        descripciones = {
+            'auto':      "Auto: elige por carácter según calibración",
+            'unicode':   "Unicode: envía scan codes (ideal en local)",
+            'vkscan':    "VkScan: simula teclas reales (ideal en RDP)",
+            'clipboard': "Clipboard: pega vía Ctrl+V (funciona siempre, más lento)",
+        }
+        _metodo_forzado = None if sel == 'auto' else sel
+        self.estado_var.set(f"Método: {descripciones.get(sel, sel)}")
 
     # ── Advertencia RDP ──
 
@@ -534,8 +577,9 @@ class TecladoSimulador:
 
             n_unicode = sum(1 for v in mapa.values() if v == 'unicode')
             n_vkscan = sum(1 for v in mapa.values() if v == 'vkscan')
+            n_clip = sum(1 for v in mapa.values() if v == 'clipboard')
 
-            msg = f"✅ Calibración OK [{self.entorno_id}] — {n_unicode} Unicode + {n_vkscan} VkScan"
+            msg = f"✅ Calibración OK [{self.entorno_id}] — {n_unicode}U + {n_vkscan}V + {n_clip}C"
             if errores:
                 chars_err = '  '.join(f"'{c}'" for c, _, _ in errores)
                 msg += f" | ⚠️ {len(errores)} sin solución: {chars_err}"
